@@ -32,6 +32,7 @@ from ragas import evaluate, EvaluationDataset, SingleTurnSample
 from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.run_config import RunConfig
 
 from utils.llm_factory import get_llm, get_embeddings
 from utils.data_loader import load_knowledge_base, split_text, build_vectorstore
@@ -167,11 +168,22 @@ def run_ragas_eval(rag_results: list, version: str) -> dict:
     llm_eval = LangchainLLMWrapper(get_llm(temperature=0))
     emb_eval = LangchainEmbeddingsWrapper(get_embeddings())
 
+    # RunConfig: hạ concurrency + tăng timeout để tránh TimeoutError do API
+    # bị quá tải. Mặc định (max_workers=16, timeout=180s) khiến mọi job
+    # timeout → mọi metric trả về NaN. Giá trị bảo thủ dưới đây ổn định hơn
+    # với gpt-4o-mini.
+    run_config = RunConfig(
+        timeout=300,      # mỗi request tối đa 5 phút
+        max_workers=4,    # tối đa 4 request đồng thời
+        max_retries=5,
+    )
+
     result = evaluate(
         dataset,
         metrics=[faithfulness, answer_relevancy, context_recall, context_precision],
         llm=llm_eval,
         embeddings=emb_eval,
+        run_config=run_config,
     )
 
     # Tính mean score cho mỗi metric
@@ -179,11 +191,17 @@ def run_ragas_eval(rag_results: list, version: str) -> dict:
     scores = {}
     for key in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
         raw = result[key]
-        scores[key] = float(np.mean([v for v in raw if v is not None]))
+        # Lọc bỏ cả None lẫn NaN (job timeout trả về NaN). Nếu không còn
+        # giá trị hợp lệ nào → để None (sẽ thành null trong JSON), tránh NaN.
+        valid = [float(v) for v in raw if v is not None and not np.isnan(v)]
+        scores[key] = float(np.mean(valid)) if valid else None
 
     # In kết quả
     print(f"\n📊 Kết quả RAGAS — Prompt {version.upper()}:")
     for k, v in scores.items():
+        if v is None:
+            print(f"  {k:30s}: N/A (không có sample hợp lệ)")
+            continue
         star = " ⭐" if k == "faithfulness" and v >= 0.8 else ""
         print(f"  {k:30s}: {v:.4f}{star}")
 
@@ -209,17 +227,26 @@ def main():
     v1_scores = run_ragas_eval(v1_results, "v1")
     v2_scores = run_ragas_eval(v2_results, "v2")
 
-    # In bảng so sánh
+    # In bảng so sánh (an toàn với giá trị None)
+    def fmt(v):
+        return f"{v:>8.4f}" if v is not None else f"{'N/A':>8}"
+
     print("\n" + "=" * 65)
     print(f"  {'Metric':30s}  {'V1':>8}  {'V2':>8}  Winner")
     print("=" * 65)
     for metric in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
-        s1, s2  = v1_scores[metric], v2_scores[metric]
-        winner  = "← V1" if s1 > s2 else "← V2"
-        print(f"  {metric:30s}  {s1:>8.4f}  {s2:>8.4f}  {winner}")
+        s1, s2 = v1_scores[metric], v2_scores[metric]
+        if s1 is None and s2 is None:
+            winner = "—"
+        elif s2 is None or (s1 is not None and s1 > s2):
+            winner = "← V1"
+        else:
+            winner = "← V2"
+        print(f"  {metric:30s}  {fmt(s1)}  {fmt(s2)}  {winner}")
 
-    # Kiểm tra mục tiêu
-    best_faith = max(v1_scores["faithfulness"], v2_scores["faithfulness"])
+    # Kiểm tra mục tiêu (coi None như 0.0 để so sánh)
+    faiths = [s for s in (v1_scores["faithfulness"], v2_scores["faithfulness"]) if s is not None]
+    best_faith = max(faiths) if faiths else 0.0
     if best_faith >= 0.8:
         print(f"\n✅ Đạt mục tiêu: faithfulness = {best_faith:.4f} ≥ 0.8")
     else:
